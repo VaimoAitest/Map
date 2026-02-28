@@ -143,6 +143,14 @@ class ValuationRequest(BaseModel):
     tolerance: float = Field(0.2, ge=0.05, le=0.6)
     radius_km: float = Field(3.0, ge=0.5, le=25.0)
 
+params = {
+  "q": q,
+  "format": "json",
+  "limit": 1,
+  "countrycodes": "ch"
+}
+
+
 @app.post("/valuation/request")
 def create_request(req: ValuationRequest):
     subj = nominatim_geocode(req.location)
