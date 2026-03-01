@@ -19,6 +19,14 @@ if os.path.isdir(STATIC_DIR):
 
 
 # -------------------------
+# Health / Debug
+# -------------------------
+@app.get("/health")
+def health():
+    return {"ok": True}
+
+
+# -------------------------
 # Parse helpers
 # -------------------------
 def parse_int_price(value: str):
@@ -51,6 +59,7 @@ def load_cache():
 
 
 def save_cache(cache):
+    # best-effort persistence (Render free disk is not guaranteed)
     try:
         tmp = CACHE_PATH + ".tmp"
         with open(tmp, "w", encoding="utf-8") as f:
@@ -69,15 +78,14 @@ def norm_key(s: str) -> str:
 
 def nominatim_geocode_ch(q: str):
     """
-    Geocode only in Switzerland (countrycodes=ch).
-    If user enters a short place like "Berg", we auto-append ", Schweiz".
+    Switzerland-only geocode (countrycodes=ch), robust (never throws -> no HTTP 500).
+    If query has no comma, auto-append ', Schweiz' to reduce ambiguity.
     Returns (lat, lon) or None.
     """
     if not q or not q.strip():
         return None
 
     q = q.strip()
-    # make ambiguous queries more Swiss-specific
     q2 = q if ("," in q) else f"{q}, Schweiz"
 
     cache_key = norm_key(q2)
@@ -94,19 +102,29 @@ def nominatim_geocode_ch(q: str):
     }
     headers = {"User-Agent": "VaimoAI/1.0 (render)"}
 
-    r = requests.get(url, params=params, headers=headers, timeout=12)
-    r.raise_for_status()
-    data = r.json()
-    if not data:
+    try:
+        r = requests.get(url, params=params, headers=headers, timeout=12)
+
+        # Nominatim can rate-limit (429) or have hiccups (5xx). Do not crash.
+        if r.status_code != 200:
+            return None
+
+        data = r.json()
+        if not data:
+            return None
+
+        lat = float(data[0]["lat"])
+        lon = float(data[0]["lon"])
+
+        GEOCODE_CACHE[cache_key] = {"lat": lat, "lon": lon, "ts": int(time.time())}
+        save_cache(GEOCODE_CACHE)
+
+        # be polite to Nominatim
+        time.sleep(0.12)
+        return (lat, lon)
+
+    except Exception:
         return None
-
-    lat = float(data[0]["lat"])
-    lon = float(data[0]["lon"])
-
-    GEOCODE_CACHE[cache_key] = {"lat": lat, "lon": lon, "ts": int(time.time())}
-    save_cache(GEOCODE_CACHE)
-    time.sleep(0.12)
-    return (lat, lon)
 
 
 def haversine_km(lat1, lon1, lat2, lon2):
@@ -121,7 +139,7 @@ def haversine_km(lat1, lon1, lat2, lon2):
 
 
 # -------------------------
-# Load dataset (your CSV)
+# Load dataset (CSV)
 # -------------------------
 def load_dataset():
     if not os.path.exists(DATA_CSV):
@@ -129,7 +147,7 @@ def load_dataset():
 
     df = pd.read_csv(DATA_CSV)
 
-    # Columns from your exported CSV (adjust if yours differs)
+    # Your expected columns (adjust if your CSV differs)
     col_address = "HgListingCard_address_3884e"
     col_title = "HgListingDescription_title_fa343"
     col_area = "HgListingRoomsLivingSpacePrice_roomsLivingSpacePrice_ab258 3"
@@ -153,11 +171,12 @@ def load_dataset():
     return df
 
 
+# Load once on startup (if this fails, Render will show the traceback)
 DATA = load_dataset()
 
 
 # -------------------------
-# Requests (MVP store)
+# Requests store (MVP)
 # -------------------------
 REQUESTS = {}
 
@@ -165,15 +184,18 @@ REQUESTS = {}
 class ValuationRequest(BaseModel):
     location: str = Field(..., description="Ort oder volle Adresse (Schweiz)")
     area_sqm: float = Field(..., gt=0)
-    tolerance: float = Field(0.2, ge=0.05, le=0.6)  # min 0.05 avoids tol=0 issues
-    radius_km: float = Field(3.0, ge=0.5, le=25.0)
+    tolerance: float = Field(0.2, ge=0.05, le=0.6)
+    radius_km: float = Field(10.0, ge=0.5, le=25.0)
 
 
 @app.post("/valuation/request")
 def create_request(req: ValuationRequest):
     subj = nominatim_geocode_ch(req.location)
     if not subj:
-        raise HTTPException(status_code=400, detail="Could not geocode location in Switzerland")
+        raise HTTPException(
+            status_code=400,
+            detail="Geocoding fehlgeschlagen (Schweiz). Bitte genauer: z.B. 'Berg TG, Schweiz' oder vollständige Adresse."
+        )
 
     request_id = "req_" + uuid.uuid4().hex[:10]
     REQUESTS[request_id] = {
@@ -185,6 +207,7 @@ def create_request(req: ValuationRequest):
         "subject_lon": subj[1],
         "ts": int(time.time()),
     }
+
     return {
         "request_id": request_id,
         "map_url": f"/map?request_id={request_id}",
@@ -202,7 +225,7 @@ def debug_request(request_id: str):
 
 
 # -------------------------
-# HTML template (NO f-string!)
+# HTML template (NO f-string -> safe on Render)
 # -------------------------
 MAP_HTML = r"""
 <!doctype html>
@@ -241,7 +264,7 @@ MAP_HTML = r"""
     .row { display:flex; gap:10px; align-items:center; flex-wrap:wrap; }
 
     .brand {
-      display:flex; align-items:center; gap:10px;
+      display:flex; align-items:center;
       padding: 6px 10px;
       border-radius: 16px;
       background: rgba(255,255,255,0.06);
@@ -272,7 +295,7 @@ MAP_HTML = r"""
     }
 
     .pill input {
-      width: 190px;
+      width: 200px;
       border: none;
       outline: none;
       background: transparent;
@@ -291,7 +314,6 @@ MAP_HTML = r"""
       background: rgba(255,255,255,0.92);
       color: #0b0b0b;
     }
-
     .btn:disabled { opacity: 0.65; cursor: default; }
     .btn:active { transform: translateY(1px); }
 
@@ -338,9 +360,9 @@ MAP_HTML = r"""
         <img src="/static/vaimo.png" onerror="this.style.display='none'" alt="VAIMO"/>
       </div>
 
-      <div class="pill" title="Ort oder genaue Adresse (Schweiz)">
+      <div class="pill" title="Ort oder Adresse in der Schweiz">
         <label>Ort</label>
-        <input id="loc" placeholder="z.B. Berg TG / Zürich / Adresse" />
+        <input id="loc" placeholder="z.B. Zürich / Berg TG / Adresse" />
       </div>
 
       <div class="pill" title="Wohnfläche deines Objekts">
@@ -348,19 +370,19 @@ MAP_HTML = r"""
         <input id="sqm" type="number" placeholder="z.B. 100" />
       </div>
 
-      <button class="btn" id="apply" type="button" title="Filter anwenden">Request</button>
-      <button class="ghost" id="toggleAdv" type="button" title="Toleranz & Radius anzeigen">Erweitert</button>
+      <button class="btn" id="apply" type="button">Request</button>
+      <button class="ghost" id="toggleAdv" type="button">Erweitert</button>
     </div>
 
     <div class="advanced" id="adv">
       <div class="pill" title="0.20 = ±20% (100m² -> 80 bis 120m²)">
         <label>Tol</label>
-        <input id="tol" type="number" step="0.05" value="0.20" placeholder="0.20" />
+        <input id="tol" type="number" step="0.05" value="0.20" />
       </div>
 
-      <div class="pill" title="Umkreis in km um den Standort">
+      <div class="pill" title="Umkreis in km">
         <label>km</label>
-        <input id="rad" type="number" step="0.5" value="10.0" placeholder="10.0" />
+        <input id="rad" type="number" step="0.5" value="10.0" />
       </div>
     </div>
 
@@ -436,8 +458,8 @@ MAP_HTML = r"""
         if (!isFinite(tol) || tol < 0.05) tol = 0.2;
         if (!isFinite(rad) || rad < 0.5) rad = 10.0;
 
-        if (!loc) { alert("Bitte Ort/Adresse eingeben (Schweiz)."); return; }
-        if (!isFinite(sqm) || sqm <= 0) { alert("Bitte Wohnfläche in m² eingeben (z.B. 100)."); return; }
+        if (!loc) { alert("Bitte Ort/Adresse in der Schweiz eingeben."); return; }
+        if (!isFinite(sqm) || sqm <= 0) { alert("Bitte m² eingeben (z.B. 100)."); return; }
 
         // timeout so it never hangs silently
         const controller = new AbortController();
@@ -469,9 +491,6 @@ MAP_HTML = r"""
 
         await loadData();
 
-        // If 0 results, give a helpful hint
-        // (We keep it simple: user can increase km/tol.)
-        // You can later auto-expand if needed.
       } catch (e) {
         alert(e.name === "AbortError" ? "Timeout (15s) – Free Render kann schlafen. Nochmal klicken." : ("JS Error: " + e.message));
       } finally {
@@ -489,6 +508,7 @@ MAP_HTML = r"""
 
 @app.get("/map", response_class=HTMLResponse)
 def map_page(request_id: str = ""):
+    # no f-string -> avoids Render crashes due to { } braces in JS/CSS
     return MAP_HTML.replace("__REQUEST_ID__", request_id or "")
 
 
@@ -505,8 +525,8 @@ def map_prices(
     filt = REQUESTS.get(request_id) if request_id else None
 
     # MVP approach:
-    # 1) Pre-filter by area if request exists
-    # 2) Geocode only the first N candidates to keep it usable on free tier
+    # 1) If request exists: filter by area first (cheap)
+    # 2) Then geocode only N candidates (to keep free tier usable)
     df = DATA
 
     if filt:
@@ -516,7 +536,7 @@ def map_prices(
         hi = target * (1 + tol)
         df = df[(df["area_sqm"] >= lo) & (df["area_sqm"] <= hi)]
 
-    # limit candidates to reduce geocode load per request
+    # limit candidates per call
     df = df.head(350)
 
     # Geocode listing addresses (cached, Switzerland-only)
@@ -551,7 +571,7 @@ def map_prices(
                 }
             })
     else:
-        # preview mode: show some points in view
+        # preview mode
         for row, lat, lon in rows[:80]:
             if not (west <= lon <= east and south <= lat <= north):
                 continue
