@@ -310,20 +310,19 @@ def geocode_worker_loop():
             wait = GEOCODE_MIN_INTERVAL_SEC - (now - _last_geocode_ts)
             if wait > 0:
                 time.sleep(wait)
+
             _last_geocode_ts = time.time()
 
-       coord = geocode_photon_ch(q)
+        coord = geocode_photon_ch(q)
+
         if coord:
             lat, lon = coord
             cache_set_ok(key, q, lat, lon)
             queue_mark_done(key)
         else:
-            # on failure we keep it as fail; you can re-enqueue later by visiting map again
             cache_set_fail(key, q, "geocode_failed_or_rate_limited", tries_inc=1)
             queue_mark_fail(key, "geocode_failed_or_rate_limited")
-            # Backoff a bit
             time.sleep(1.0)
-
 
 @app.on_event("startup")
 def startup():
