@@ -133,8 +133,6 @@ def queue_size() -> int:
     n = cur.fetchone()[0]
     conn.close()
     return int(n)
-
-
 def enqueue_geocode(q: str) -> str:
     """
     Enqueue if not cached and not queued.
@@ -156,7 +154,7 @@ def enqueue_geocode(q: str) -> str:
     if queue_size() >= GEOCODE_QUEUE_MAX:
         return key
 
-      now = int(time.time())
+    now = int(time.time())
     conn = db_conn()
     conn.execute("""
       INSERT INTO queue(key,q,status,tries,last_error,updated_at)
@@ -172,36 +170,6 @@ def enqueue_geocode(q: str) -> str:
     conn.commit()
     conn.close()
     return key
-
-
-def queue_take_one() -> Optional[Tuple[str, str, int]]:
-    conn = db_conn()
-    cur = conn.cursor()
-    cur.execute("""
-      SELECT key, q, tries FROM queue
-      WHERE status='queued'
-      ORDER BY updated_at ASC
-      LIMIT 1
-    """)
-    row = cur.fetchone()
-    if not row:
-        conn.close()
-        return None
-
-    key, q, tries = row
-    now = int(time.time())
-    cur.execute("UPDATE queue SET status='working', updated_at=? WHERE key=?", (now, key))
-    conn.commit()
-    conn.close()
-    return (key, q, int(tries))
-
-
-def queue_mark_done(key: str):
-    conn = db_conn()
-    now = int(time.time())
-    conn.execute("UPDATE queue SET status='done', updated_at=? WHERE key=?", (now, key))
-    conn.commit()
-    conn.close()
 
 
 def queue_mark_fail(key: str, err: str):
