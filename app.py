@@ -156,18 +156,18 @@ def enqueue_geocode(q: str) -> str:
     if queue_size() >= GEOCODE_QUEUE_MAX:
         return key
 
-    now = int(time.time())
+      now = int(time.time())
     conn = db_conn()
-  conn.execute("""
-  INSERT INTO queue(key,q,status,tries,last_error,updated_at)
-  VALUES(?, ?, 'queued', 0, NULL, ?)
-  ON CONFLICT(key) DO UPDATE SET
-    q=excluded.q,
-    status='queued',
-    tries=0,
-    last_error=NULL,
-    updated_at=excluded.updated_at;
-""", (key, q2, now))
+    conn.execute("""
+      INSERT INTO queue(key,q,status,tries,last_error,updated_at)
+      VALUES(?, ?, 'queued', 0, NULL, ?)
+      ON CONFLICT(key) DO UPDATE SET
+        q=excluded.q,
+        status='queued',
+        tries=0,
+        last_error=NULL,
+        updated_at=excluded.updated_at;
+    """, (key, q2, now))
 
     conn.commit()
     conn.close()
