@@ -15,9 +15,14 @@ STATIC_DIR = os.path.join(BASE_DIR, "static")
 DATA_CSV = os.getenv("DATA_CSV", os.path.join(BASE_DIR, "data", "immoscout.csv"))
 DB_PATH = os.getenv("GEO_DB", os.path.join(BASE_DIR, "geocache.sqlite"))
 
+PHOTON_API = os.getenv("PHOTON_API", "https://photon.komoot.io/api/")
+PHOTON_LANG = os.getenv("PHOTON_LANG", "de")
+
 # Rate-limiting: one geocode per X seconds (safe-ish for Nominatim)
 GEOCODE_MIN_INTERVAL_SEC = float(os.getenv("GEOCODE_MIN_INTERVAL_SEC", "1.2"))
 GEOCODE_QUEUE_MAX = int(os.getenv("GEOCODE_QUEUE_MAX", "5000"))
+
+
 
 if os.path.isdir(STATIC_DIR):
     app.mount("/static", StaticFiles(directory=STATIC_DIR), name="static")
@@ -153,12 +158,17 @@ def enqueue_geocode(q: str) -> str:
 
     now = int(time.time())
     conn = db_conn()
-    conn.execute("""
-      INSERT INTO queue(key,q,status,tries,last_error,updated_at)
-      VALUES(?, ?, 'queued', 0, NULL, ?)
-      ON CONFLICT(key) DO UPDATE SET
-        updated_at=excluded.updated_at;
-    """, (key, q2, now))
+  conn.execute("""
+  INSERT INTO queue(key,q,status,tries,last_error,updated_at)
+  VALUES(?, ?, 'queued', 0, NULL, ?)
+  ON CONFLICT(key) DO UPDATE SET
+    q=excluded.q,
+    status='queued',
+    tries=0,
+    last_error=NULL,
+    updated_at=excluded.updated_at;
+""", (key, q2, now))
+
     conn.commit()
     conn.close()
     return key
@@ -209,23 +219,61 @@ def queue_mark_fail(key: str, err: str):
 # -------------------------
 # Geocoding (Switzerland only, robust)
 # -------------------------
-def geocode_nominatim_ch(q: str) -> Optional[Tuple[float, float]]:
+def _is_ch_feature(props: dict) -> bool:
+    cc = (props.get("countrycode") or props.get("countryCode") or "").upper()
+    country = (props.get("country") or "").lower()
+    return (cc == "CH") or ("switzerland" in country) or ("schweiz" in country)
+
+
+def geocode_photon_ch(q: str) -> Optional[Tuple[float, float]]:
     """
-    Returns (lat, lon) or None. Never raises.
-    Handles 429 by returning None (worker will retry later).
+    Photon geocoding, bevorzugt Schweiz.
+    Gibt (lat, lon) oder None zurück. Wirft nie Fehler.
     """
-    url = "https://nominatim.openstreetmap.org/search"
-    params = {"q": q, "format": "json", "limit": 1, "countrycodes": "ch"}
-    headers = {"User-Agent": "VaimoAI/1.0 (render demo)"}
+    if not q or not q.strip():
+        return None
+
+    q = q.strip()
+    q2 = q if ("," in q) else f"{q}, Schweiz"
 
     try:
-        r = requests.get(url, params=params, headers=headers, timeout=12)
+        r = requests.get(
+            PHOTON_API,
+            params={
+                "q": q2,
+                "limit": 5,
+                "lang": PHOTON_LANG,
+            },
+            headers={"User-Agent": "VaimoAI/1.0"},
+            timeout=12,
+        )
+
         if r.status_code != 200:
             return None
-        data = r.json()
-        if not data:
+
+        data = r.json() or {}
+        features = data.get("features") or []
+        if not features:
             return None
-        return (float(data[0]["lat"]), float(data[0]["lon"]))
+
+        chosen = None
+        for f in features:
+            props = f.get("properties") or {}
+            if _is_ch_feature(props):
+                chosen = f
+                break
+
+        if not chosen:
+            chosen = features[0]
+
+        geom = chosen.get("geometry") or {}
+        coords = geom.get("coordinates") or []
+        if len(coords) < 2:
+            return None
+
+        lon, lat = float(coords[0]), float(coords[1])
+        return (lat, lon)
+
     except Exception:
         return None
 
@@ -264,7 +312,7 @@ def geocode_worker_loop():
                 time.sleep(wait)
             _last_geocode_ts = time.time()
 
-        coord = geocode_nominatim_ch(q)
+       coord = geocode_photon_ch(q)
         if coord:
             lat, lon = coord
             cache_set_ok(key, q, lat, lon)
@@ -381,7 +429,7 @@ def create_request(req: ValuationRequest):
     if not subj:
         q2 = req.location.strip()
         q2 = q2 if ("," in q2) else f"{q2}, Schweiz"
-        coord = geocode_nominatim_ch(q2)
+        coord = geocode_photon_ch(q2)
         if coord:
             cache_set_ok(key, q2, coord[0], coord[1])
             subj = coord
@@ -579,6 +627,10 @@ MAP_HTML = r"""
 </body>
 </html>
 """
+
+@app.get("/health")
+def health():
+    return {"ok": True, "geocoder": "photon", "photon_api": PHOTON_API}
 
 
 @app.get("/map", response_class=HTMLResponse)
