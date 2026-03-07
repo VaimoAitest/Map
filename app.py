@@ -484,6 +484,18 @@ def debug_request(request_id: str):
     return r
 
 
+from fastapi import Request
+
+@app.middleware("http")
+async def allow_iframe_embedding(request: Request, call_next):
+    response = await call_next(request)
+
+    # Erlaube Einbettung in andere Seiten
+    response.headers["Content-Security-Policy"] = "frame-ancestors *;"
+    response.headers.pop("X-Frame-Options", None)
+
+    return response
+
 # -------------------------
 # HTML (safe: no f-string)
 # -------------------------
