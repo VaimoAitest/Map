@@ -43,7 +43,10 @@ app.add_middleware(
 @app.middleware("http")
 async def allow_iframe_embedding(request: Request, call_next):
     response = await call_next(request)
-    response.headers.pop("X-Frame-Options", None)
+
+    if "x-frame-options" in response.headers:
+        del response.headers["x-frame-options"]
+
     response.headers["Content-Security-Policy"] = "frame-ancestors *;"
     return response
 
