@@ -1,472 +1,188 @@
-import os
-import re
-import uuid
 import math
+import os
 import time
-import sqlite3
-import threading
-from typing import Optional, Tuple
+import uuid
+from typing import Dict, Optional, Tuple
 
 import pandas as pd
 import requests
-from fastapi import FastAPI, Query, HTTPException, Request
+from fastapi import FastAPI, HTTPException, Query
 from fastapi.responses import HTMLResponse, JSONResponse
 from fastapi.staticfiles import StaticFiles
-from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel, Field
 
-app = FastAPI(title="VaimoAI Comparable Map")
-
-BASE_DIR = os.path.dirname(os.path.abspath(__file__))
-STATIC_DIR = os.path.join(BASE_DIR, "static")
-DATA_CSV = os.getenv("DATA_CSV", os.path.join(BASE_DIR, "data", "immoscout.csv"))
-DB_PATH = os.getenv("GEO_DB", os.path.join(BASE_DIR, "geocache.sqlite"))
-
-PHOTON_API = os.getenv("PHOTON_API", "https://photon.komoot.io/api/")
-PHOTON_LANG = os.getenv("PHOTON_LANG", "de")
-
-GEOCODE_MIN_INTERVAL_SEC = float(os.getenv("GEOCODE_MIN_INTERVAL_SEC", "1.2"))
-GEOCODE_QUEUE_MAX = int(os.getenv("GEOCODE_QUEUE_MAX", "5000"))
-
-if os.path.isdir(STATIC_DIR):
-    app.mount("/static", StaticFiles(directory=STATIC_DIR), name="static")
-
-app.add_middleware(
-    CORSMiddleware,
-    allow_origins=["*"],
-    allow_credentials=False,
-    allow_methods=["*"],
-    allow_headers=["*"],
-)
-
-
-@app.middleware("http")
-async def allow_iframe_embedding(request: Request, call_next):
-    response = await call_next(request)
-
-    if "x-frame-options" in response.headers:
-        del response.headers["x-frame-options"]
-
-    response.headers["Content-Security-Policy"] = "frame-ancestors *;"
-    return response
-
+app = FastAPI(title="Vaimo Comparable Map API", version="1.1.0")
 
 # -------------------------
-# Health
+# Static files
 # -------------------------
-@app.get("/health")
-def health():
-    return {
-        "ok": True,
-        "csv_exists": os.path.exists(DATA_CSV),
-        "db_path": DB_PATH,
-        "photon_api": PHOTON_API,
-    }
-
+if os.path.isdir("static"):
+    app.mount("/static", StaticFiles(directory="static"), name="static")
 
 # -------------------------
-# SQLite helpers
+# Config
 # -------------------------
-def db_conn():
-    conn = sqlite3.connect(DB_PATH, check_same_thread=False)
-    conn.execute("PRAGMA journal_mode=WAL;")
-    conn.execute("PRAGMA synchronous=NORMAL;")
-    return conn
+DATA_PATHS = [
+    "data/immoscout.csv",
+    "data/immoscout24.csv",
+    "data/immoscout24 (2).csv",
+]
 
+GEOCODE_TTL_SECONDS = 60 * 60 * 24 * 14  # 14 Tage
+REQUEST_TTL_SECONDS = 60 * 60 * 12        # 12 Stunden
 
-def db_init():
-    conn = db_conn()
-    cur = conn.cursor()
+# -------------------------
+# In-memory caches
+# -------------------------
+GEOCODE_CACHE: Dict[str, Dict] = {}
+REQUESTS: Dict[str, Dict] = {}
 
-    cur.execute("""
-    CREATE TABLE IF NOT EXISTS geocache (
-        key TEXT PRIMARY KEY,
-        q TEXT NOT NULL,
-        lat REAL,
-        lon REAL,
-        status TEXT NOT NULL DEFAULT 'ok',
-        tries INTEGER NOT NULL DEFAULT 0,
-        last_error TEXT,
-        updated_at INTEGER NOT NULL
-    );
-    """)
-
-    cur.execute("""
-    CREATE TABLE IF NOT EXISTS queue (
-        key TEXT PRIMARY KEY,
-        q TEXT NOT NULL,
-        status TEXT NOT NULL DEFAULT 'queued',
-        tries INTEGER NOT NULL DEFAULT 0,
-        last_error TEXT,
-        updated_at INTEGER NOT NULL
-    );
-    """)
-
-    conn.commit()
-    conn.close()
-
-
-db_init()
+DATA_CACHE: Optional[pd.DataFrame] = None
+DATA_CACHE_ERROR: Optional[str] = None
 
 
 # -------------------------
 # Helpers
 # -------------------------
-def norm_key(s: str) -> str:
-    return re.sub(r"\s+", " ", (s or "").strip().lower())
+def normalize_text(s: str) -> str:
+    return " ".join(str(s or "").strip().lower().split())
 
 
-def parse_float_area(value: str):
-    if not isinstance(value, str):
+def enqueue_geocode(address: str) -> str:
+    return normalize_text(address)
+
+
+def cache_get(key: str) -> Optional[Tuple[float, float]]:
+    item = GEOCODE_CACHE.get(key)
+    if not item:
         return None
-    v = value.replace(",", ".")
-    m = re.search(r"(\d+(?:\.\d+)?)\s*m", v)
-    return float(m.group(1)) if m else None
-
-
-def parse_int_price(value: str):
-    if not isinstance(value, str):
+    if (time.time() - item["ts"]) > GEOCODE_TTL_SECONDS:
         return None
-    cleaned = value.replace("’", "").replace("'", "")
-    digits = re.findall(r"\d+", cleaned)
-    return int("".join(digits)) if digits else None
+    return (item["lat"], item["lon"])
 
 
-def haversine_km(lat1, lon1, lat2, lon2):
-    R = 6371.0
+def cache_set_ok(key: str, query: str, lat: float, lon: float) -> None:
+    GEOCODE_CACHE[key] = {
+        "query": query,
+        "lat": float(lat),
+        "lon": float(lon),
+        "ts": int(time.time()),
+    }
+
+
+def geocode_photon_ch(query: str) -> Optional[Tuple[float, float]]:
+    try:
+        url = "https://photon.komoot.io/api/"
+        params = {
+            "q": query,
+            "limit": 1,
+            "lang": "de",
+        }
+        r = requests.get(url, params=params, timeout=12)
+        r.raise_for_status()
+        data = r.json()
+        features = data.get("features", [])
+        if not features:
+            return None
+        coords = features[0]["geometry"]["coordinates"]
+        lon, lat = coords[0], coords[1]
+        return float(lat), float(lon)
+    except Exception:
+        return None
+
+
+def haversine_km(lat1: float, lon1: float, lat2: float, lon2: float) -> float:
+    r = 6371.0
     p1 = math.radians(lat1)
     p2 = math.radians(lat2)
-    dlat = math.radians(lat2 - lat1)
-    dlon = math.radians(lon2 - lon1)
-    a = math.sin(dlat / 2) ** 2 + math.cos(p1) * math.cos(p2) * math.sin(dlon / 2) ** 2
-    c = 2 * math.atan2(math.sqrt(a), math.sqrt(1 - a))
-    return R * c
+    dp = math.radians(lat2 - lat1)
+    dl = math.radians(lon2 - lon1)
+
+    a = math.sin(dp / 2) ** 2 + math.cos(p1) * math.cos(p2) * math.sin(dl / 2) ** 2
+    return 2 * r * math.asin(math.sqrt(a))
 
 
-# -------------------------
-# Dataset (lazy load, safe)
-# -------------------------
-DATA_CACHE = None
-DATA_CACHE_ERROR = None
+def cleanup_requests() -> None:
+    now = int(time.time())
+    stale = [
+        req_id for req_id, payload in REQUESTS.items()
+        if (now - int(payload.get("ts", now))) > REQUEST_TTL_SECONDS
+    ]
+    for req_id in stale:
+        REQUESTS.pop(req_id, None)
 
 
-def load_dataset_safe():
+def guess_column(df: pd.DataFrame, candidates) -> Optional[str]:
+    lower_map = {str(c).strip().lower(): c for c in df.columns}
+    for cand in candidates:
+        if cand.lower() in lower_map:
+            return lower_map[cand.lower()]
+    return None
+
+
+def load_dataset_safe() -> pd.DataFrame:
     global DATA_CACHE, DATA_CACHE_ERROR
 
     if DATA_CACHE is not None:
         return DATA_CACHE
 
-    if not os.path.exists(DATA_CSV):
-        DATA_CACHE_ERROR = f"CSV not found: {DATA_CSV}"
-        DATA_CACHE = pd.DataFrame(columns=["address", "title", "area_sqm", "price_chf", "url"])
-        return DATA_CACHE
+    last_error = None
+    found_path = None
+
+    for path in DATA_PATHS:
+        if os.path.exists(path):
+            found_path = path
+            break
+
+    if not found_path:
+        DATA_CACHE_ERROR = f"Keine CSV gefunden. Erwartet in: {', '.join(DATA_PATHS)}"
+        raise HTTPException(status_code=500, detail=DATA_CACHE_ERROR)
 
     try:
-        df = pd.read_csv(DATA_CSV)
+        df = pd.read_csv(found_path)
 
-        col_address = "HgListingCard_address_3884e"
-        col_title = "HgListingDescription_title_fa343"
-        col_area = "HgListingRoomsLivingSpacePrice_roomsLivingSpacePrice_ab258 3"
-        col_price = "HgListingRoomsLivingSpacePrice_price_ad2cb"
-        col_url = "HgCardElevated_content_900d9 href"
+        title_col = guess_column(df, ["title", "titel"])
+        address_col = guess_column(df, ["address", "adresse"])
+        price_col = guess_column(df, ["price_chf", "price", "preis", "preis_chf"])
+        area_col = guess_column(df, ["area_sqm", "living_area_sqm", "living_area", "fläche", "flaeche", "wohnfläche", "wohnflaeche"])
+        url_col = guess_column(df, ["url", "link"])
 
-        for c in [col_address, col_title, col_area, col_price]:
-            if c not in df.columns:
-                raise ValueError(f"Missing column: {c}")
+        missing = [name for name, col in {
+            "title": title_col,
+            "address": address_col,
+            "price_chf": price_col,
+            "area_sqm": area_col,
+        }.items() if col is None]
 
-        df = df.copy()
-        df["address"] = df[col_address].astype(str)
-        df["title"] = df[col_title].astype(str)
-        df["area_sqm"] = df[col_area].apply(parse_float_area)
-        df["price_chf"] = df[col_price].apply(parse_int_price)
-        df["url"] = df[col_url].astype(str) if col_url in df.columns else ""
+        if missing:
+            raise ValueError(f"Fehlende CSV-Spalten: {', '.join(missing)}")
 
-        df = df.dropna(subset=["area_sqm", "price_chf"])
-        df["area_sqm"] = df["area_sqm"].astype(float)
-        df["price_chf"] = df["price_chf"].astype(int)
+        clean = pd.DataFrame({
+            "title": df[title_col].astype(str).fillna(""),
+            "address": df[address_col].astype(str).fillna(""),
+            "price_chf": pd.to_numeric(df[price_col], errors="coerce"),
+            "area_sqm": pd.to_numeric(df[area_col], errors="coerce"),
+            "url": df[url_col].astype(str).fillna("") if url_col else "",
+        })
 
-        DATA_CACHE = df
+        clean = clean.dropna(subset=["price_chf", "area_sqm"])
+        clean = clean[clean["price_chf"] > 0]
+        clean = clean[clean["area_sqm"] > 0]
+        clean = clean.drop_duplicates(subset=["title", "address", "price_chf", "area_sqm"]).reset_index(drop=True)
+
+        DATA_CACHE = clean
         DATA_CACHE_ERROR = None
         return DATA_CACHE
 
     except Exception as e:
-        DATA_CACHE_ERROR = str(e)
-        DATA_CACHE = pd.DataFrame(columns=["address", "title", "area_sqm", "price_chf", "url"])
-        return DATA_CACHE
-
-
-@app.get("/debug/data")
-def debug_data():
-    df = load_dataset_safe()
-    return {
-        "rows": int(len(df)),
-        "error": DATA_CACHE_ERROR,
-        "csv_path": DATA_CSV,
-        "csv_exists": os.path.exists(DATA_CSV),
-    }
+        last_error = str(e)
+        DATA_CACHE_ERROR = last_error
+        raise HTTPException(status_code=500, detail=f"CSV konnte nicht geladen werden: {last_error}")
 
 
 # -------------------------
-# Cache / Queue
+# Models
 # -------------------------
-def cache_get(key: str) -> Optional[Tuple[float, float]]:
-    conn = db_conn()
-    cur = conn.cursor()
-    cur.execute("SELECT lat, lon, status FROM geocache WHERE key=?", (key,))
-    row = cur.fetchone()
-    conn.close()
-
-    if not row:
-        return None
-
-    lat, lon, status = row
-    if status == "ok" and lat is not None and lon is not None:
-        return (float(lat), float(lon))
-    return None
-
-
-def cache_set_ok(key: str, q: str, lat: float, lon: float):
-    now = int(time.time())
-    conn = db_conn()
-    conn.execute("""
-      INSERT INTO geocache(key,q,lat,lon,status,tries,last_error,updated_at)
-      VALUES(?,?,?,?, 'ok', 0, NULL, ?)
-      ON CONFLICT(key) DO UPDATE SET
-        q=excluded.q,
-        lat=excluded.lat,
-        lon=excluded.lon,
-        status='ok',
-        last_error=NULL,
-        updated_at=excluded.updated_at;
-    """, (key, q, lat, lon, now))
-    conn.commit()
-    conn.close()
-
-
-def cache_set_fail(key: str, q: str, err: str, tries_inc: int = 1):
-    now = int(time.time())
-    conn = db_conn()
-    conn.execute("""
-      INSERT INTO geocache(key,q,lat,lon,status,tries,last_error,updated_at)
-      VALUES(?,?,?,?, 'fail', ?, ?, ?)
-      ON CONFLICT(key) DO UPDATE SET
-        q=excluded.q,
-        status='fail',
-        tries=geocache.tries+?,
-        last_error=?,
-        updated_at=?;
-    """, (key, q, None, None, tries_inc, err[:500], now, tries_inc, err[:500], now))
-    conn.commit()
-    conn.close()
-
-
-def queue_size() -> int:
-    conn = db_conn()
-    cur = conn.cursor()
-    cur.execute("SELECT COUNT(*) FROM queue WHERE status IN ('queued','working')")
-    n = cur.fetchone()[0]
-    conn.close()
-    return int(n)
-
-
-def enqueue_geocode(q: str) -> str:
-    q = (q or "").strip()
-    if not q:
-        return ""
-
-    q2 = q if ("," in q) else f"{q}, Schweiz"
-    key = norm_key(q2)
-
-    if cache_get(key):
-        return key
-
-    if queue_size() >= GEOCODE_QUEUE_MAX:
-        return key
-
-    now = int(time.time())
-    conn = db_conn()
-    conn.execute("""
-      INSERT INTO queue(key,q,status,tries,last_error,updated_at)
-      VALUES(?, ?, 'queued', 0, NULL, ?)
-      ON CONFLICT(key) DO UPDATE SET
-        updated_at=excluded.updated_at;
-    """, (key, q2, now))
-    conn.commit()
-    conn.close()
-    return key
-
-
-def queue_take_one() -> Optional[Tuple[str, str]]:
-    conn = db_conn()
-    cur = conn.cursor()
-    cur.execute("""
-      SELECT key, q FROM queue
-      WHERE status='queued'
-      ORDER BY updated_at ASC
-      LIMIT 1
-    """)
-    row = cur.fetchone()
-    if not row:
-        conn.close()
-        return None
-
-    key, q = row
-    now = int(time.time())
-    cur.execute("UPDATE queue SET status='working', updated_at=? WHERE key=?", (now, key))
-    conn.commit()
-    conn.close()
-    return key, q
-
-
-def queue_mark_done(key: str):
-    conn = db_conn()
-    now = int(time.time())
-    conn.execute("UPDATE queue SET status='done', updated_at=? WHERE key=?", (now, key))
-    conn.commit()
-    conn.close()
-
-
-def queue_mark_fail(key: str, err: str):
-    conn = db_conn()
-    now = int(time.time())
-    conn.execute("""
-      UPDATE queue
-      SET status='fail', tries=tries+1, last_error=?, updated_at=?
-      WHERE key=?
-    """, (err[:500], now, key))
-    conn.commit()
-    conn.close()
-
-
-# -------------------------
-# Photon geocoding
-# -------------------------
-def _is_ch_feature(props: dict) -> bool:
-    cc = (props.get("countrycode") or props.get("countryCode") or "").upper()
-    country = (props.get("country") or "").lower()
-    return (cc == "CH") or ("switzerland" in country) or ("schweiz" in country)
-
-
-def geocode_photon_ch(q: str) -> Optional[Tuple[float, float]]:
-    if not q or not q.strip():
-        return None
-
-    q = q.strip()
-    q2 = q if ("," in q) else f"{q}, Schweiz"
-
-    try:
-        r = requests.get(
-            PHOTON_API,
-            params={"q": q2, "limit": 5, "lang": PHOTON_LANG},
-            headers={"User-Agent": "VaimoAI/1.0"},
-            timeout=12,
-        )
-
-        if r.status_code != 200:
-            return None
-
-        data = r.json() or {}
-        features = data.get("features") or []
-        if not features:
-            return None
-
-        chosen = None
-        for f in features:
-            props = f.get("properties") or {}
-            if _is_ch_feature(props):
-                chosen = f
-                break
-
-        if not chosen:
-            chosen = features[0]
-
-        geom = chosen.get("geometry") or {}
-        coords = geom.get("coordinates") or []
-        if len(coords) < 2:
-            return None
-
-        lon, lat = float(coords[0]), float(coords[1])
-        return (lat, lon)
-
-    except Exception:
-        return None
-
-
-# -------------------------
-# Worker
-# -------------------------
-_worker_started = False
-_worker_lock = threading.Lock()
-_last_geocode_ts = 0.0
-
-
-def geocode_worker_loop():
-    global _last_geocode_ts
-
-    while True:
-        item = queue_take_one()
-        if not item:
-            time.sleep(1.0)
-            continue
-
-        key, q = item
-
-        if cache_get(key):
-            queue_mark_done(key)
-            continue
-
-        with _worker_lock:
-            now = time.time()
-            wait = GEOCODE_MIN_INTERVAL_SEC - (now - _last_geocode_ts)
-            if wait > 0:
-                time.sleep(wait)
-            _last_geocode_ts = time.time()
-
-        coord = geocode_photon_ch(q)
-
-        if coord:
-            lat, lon = coord
-            cache_set_ok(key, q, lat, lon)
-            queue_mark_done(key)
-        else:
-            cache_set_fail(key, q, "geocode_failed", tries_inc=1)
-            queue_mark_fail(key, "geocode_failed")
-            time.sleep(1.0)
-
-
-@app.on_event("startup")
-def startup():
-    global _worker_started
-    if not _worker_started:
-        t = threading.Thread(target=geocode_worker_loop, daemon=True)
-        t.start()
-        _worker_started = True
-
-
-@app.get("/admin/queue")
-def admin_queue():
-    conn = db_conn()
-    cur = conn.cursor()
-    cur.execute("SELECT status, COUNT(*) FROM queue GROUP BY status")
-    q_stats = {row[0]: row[1] for row in cur.fetchall()}
-    cur.execute("SELECT status, COUNT(*) FROM geocache GROUP BY status")
-    c_stats = {row[0]: row[1] for row in cur.fetchall()}
-    conn.close()
-
-    return {
-        "queue": q_stats,
-        "cache": c_stats,
-        "db_path": DB_PATH,
-        "csv_error": DATA_CACHE_ERROR,
-    }
-
-
-# -------------------------
-# Requests
-# -------------------------
-REQUESTS = {}
-
-
 class ValuationRequest(BaseModel):
     location: str = Field(..., description="Ort oder volle Adresse (Schweiz)")
     area_sqm: float = Field(..., gt=0)
@@ -474,8 +190,34 @@ class ValuationRequest(BaseModel):
     radius_km: float = Field(10.0, ge=0.5, le=25.0)
 
 
+# -------------------------
+# API
+# -------------------------
+@app.get("/")
+def root():
+    return {"ok": True, "service": "Vaimo Comparable Map API"}
+
+
+@app.get("/health")
+def health():
+    try:
+        df = load_dataset_safe()
+        count = int(len(df))
+    except Exception:
+        count = 0
+
+    return {
+        "ok": True,
+        "dataset_rows": count,
+        "csv_error": DATA_CACHE_ERROR,
+        "requests_in_memory": len(REQUESTS),
+    }
+
+
 @app.post("/valuation/request")
 def create_request(req: ValuationRequest):
+    cleanup_requests()
+
     key = enqueue_geocode(req.location)
     subj = cache_get(key)
 
@@ -506,14 +248,33 @@ def create_request(req: ValuationRequest):
 
     return {
         "request_id": request_id,
-        "map_url": f"/map?request_id={request_id}",
+        "map_url": f"https://map-skur.onrender.com/map?request_id={request_id}",
         "subject_lat": float(subj[0]),
         "subject_lon": float(subj[1]),
     }
 
 
+@app.get("/valuation/map/{request_id}")
+def get_comparable_map(request_id: str):
+    cleanup_requests()
+
+    r = REQUESTS.get(request_id)
+    if not r:
+        raise HTTPException(status_code=404, detail="unknown request_id")
+
+    url = f"https://map-skur.onrender.com/map?request_id={request_id}"
+    return {
+        "request_id": request_id,
+        "map_url": url,
+        "embed_url": url,
+        "image_url": None,
+    }
+
+
 @app.get("/debug/request/{request_id}")
 def debug_request(request_id: str):
+    cleanup_requests()
+
     r = REQUESTS.get(request_id)
     if not r:
         raise HTTPException(status_code=404, detail="unknown request_id")
@@ -521,7 +282,7 @@ def debug_request(request_id: str):
 
 
 # -------------------------
-# HTML
+# Frontend HTML
 # -------------------------
 MAP_HTML = r"""
 <!doctype html>
@@ -532,46 +293,152 @@ MAP_HTML = r"""
   <title>Vaimo – Comparable Map</title>
   <link rel="stylesheet" href="https://unpkg.com/leaflet@1.9.4/dist/leaflet.css"/>
   <style>
-    html, body, #map { height:100%; margin:0; background:#0b0b0b; font-family:-apple-system,BlinkMacSystemFont,"Segoe UI",Arial,sans-serif; }
+    html, body, #map {
+      height:100%;
+      margin:0;
+      background:#0b0b0b;
+      font-family:-apple-system,BlinkMacSystemFont,"Segoe UI",Arial,sans-serif;
+    }
     .topbar {
-      position:absolute; top:14px; left:50%; transform:translateX(-50%);
-      z-index:1000; width:min(980px, calc(100% - 28px));
-      background:rgba(15,15,17,0.55); border:1px solid rgba(255,255,255,0.12);
-      border-radius:22px; padding:12px 12px;
-      backdrop-filter:blur(14px); -webkit-backdrop-filter:blur(14px);
+      position:absolute;
+      top:14px;
+      left:50%;
+      transform:translateX(-50%);
+      z-index:1000;
+      width:min(980px, calc(100% - 28px));
+      background:rgba(15,15,17,0.55);
+      border:1px solid rgba(255,255,255,0.12);
+      border-radius:22px;
+      padding:12px 12px;
+      backdrop-filter:blur(14px);
+      -webkit-backdrop-filter:blur(14px);
       box-shadow:0 16px 40px rgba(0,0,0,0.35);
     }
-    .row { display:flex; gap:10px; align-items:center; flex-wrap:wrap; }
-    .brand { display:flex; align-items:center; padding:6px 10px; border-radius:16px; background:rgba(255,255,255,0.06); border:1px solid rgba(255,255,255,0.10); }
-    .brand img { width:84px; height:auto; display:block; background:transparent; padding:0; border-radius:0; }
-    .pill { display:flex; align-items:center; gap:8px; padding:8px 10px; border-radius:16px; background:rgba(255,255,255,0.06); border:1px solid rgba(255,255,255,0.12); }
-    .pill label { font-size:12px; color:rgba(255,255,255,0.70); white-space:nowrap; }
-    .pill input { width:200px; border:none; outline:none; background:transparent; color:white; font-size:14px; }
-    .pill input[type="number"] { width:115px; }
-    .btn { border:none; cursor:pointer; padding:10px 14px; border-radius:16px; font-weight:800; background:rgba(255,255,255,0.92); color:#0b0b0b; }
-    .btn:disabled { opacity:0.65; cursor:default; }
-    .ghost { border:1px solid rgba(255,255,255,0.14); background:rgba(255,255,255,0.06); color:rgba(255,255,255,0.92); padding:10px 12px; border-radius:16px; cursor:pointer; font-weight:700; }
-    .advanced { display:none; margin-top:10px; gap:10px; align-items:center; flex-wrap:wrap; }
-    .hint { margin-top:8px; font-size:12px; color:rgba(255,255,255,0.70); padding:0 8px; }
-    .price-label { background:rgba(255,255,255,0.96); border-radius:16px; padding:6px 10px; font-weight:800; box-shadow:0 8px 24px rgba(0,0,0,0.22); white-space:nowrap; }
+    .row {
+      display:flex;
+      gap:10px;
+      align-items:center;
+      flex-wrap:wrap;
+    }
+    .brand {
+      display:flex;
+      align-items:center;
+      padding:6px 10px;
+      border-radius:16px;
+      background:rgba(255,255,255,0.06);
+      border:1px solid rgba(255,255,255,0.10);
+    }
+    .brand img {
+      width:84px;
+      height:auto;
+      display:block;
+      background:transparent;
+      padding:0;
+      border-radius:0;
+    }
+    .pill {
+      display:flex;
+      align-items:center;
+      gap:8px;
+      padding:8px 10px;
+      border-radius:16px;
+      background:rgba(255,255,255,0.06);
+      border:1px solid rgba(255,255,255,0.12);
+    }
+    .pill label {
+      font-size:12px;
+      color:rgba(255,255,255,0.70);
+      white-space:nowrap;
+    }
+    .pill input {
+      width:200px;
+      border:none;
+      outline:none;
+      background:transparent;
+      color:white;
+      font-size:14px;
+    }
+    .pill input[type="number"] {
+      width:115px;
+    }
+    .btn {
+      border:none;
+      cursor:pointer;
+      padding:10px 14px;
+      border-radius:16px;
+      font-weight:800;
+      background:rgba(255,255,255,0.92);
+      color:#0b0b0b;
+    }
+    .btn:disabled {
+      opacity:0.65;
+      cursor:default;
+    }
+    .ghost {
+      border:1px solid rgba(255,255,255,0.14);
+      background:rgba(255,255,255,0.06);
+      color:rgba(255,255,255,0.92);
+      padding:10px 12px;
+      border-radius:16px;
+      cursor:pointer;
+      font-weight:700;
+    }
+    .advanced {
+      display:none;
+      margin-top:10px;
+      gap:10px;
+      align-items:center;
+      flex-wrap:wrap;
+    }
+    .hint {
+      margin-top:8px;
+      font-size:12px;
+      color:rgba(255,255,255,0.70);
+      padding:0 8px;
+    }
+    .price-label {
+      background:rgba(255,255,255,0.96);
+      border-radius:16px;
+      padding:6px 10px;
+      font-weight:800;
+      box-shadow:0 8px 24px rgba(0,0,0,0.22);
+      white-space:nowrap;
+    }
   </style>
 </head>
 <body>
   <div class="topbar">
     <div class="row">
-      <div class="brand"><img src="/static/vaimo.png" onerror="this.style.display='none'" alt="VAIMO"/></div>
-      <div class="pill"><label>Ort</label><input id="loc" placeholder="z.B. Zürich / Berg TG / Adresse"/></div>
-      <div class="pill"><label>m²</label><input id="sqm" type="number" placeholder="z.B. 100"/></div>
+      <div class="brand">
+        <img src="/static/vaimo.png" onerror="this.style.display='none'" alt="VAIMO"/>
+      </div>
+
+      <div class="pill">
+        <label>Ort</label>
+        <input id="loc" placeholder="z.B. Zürich / Berg TG / Adresse"/>
+      </div>
+
+      <div class="pill">
+        <label>m²</label>
+        <input id="sqm" type="number" placeholder="z.B. 100"/>
+      </div>
+
       <button class="btn" id="apply" type="button">Request</button>
       <button class="ghost" id="toggleAdv" type="button">Erweitert</button>
     </div>
 
     <div class="advanced" id="adv">
-      <div class="pill"><label>Tol</label><input id="tol" type="number" step="0.05" value="0.20"/></div>
-      <div class="pill"><label>km</label><input id="rad" type="number" step="0.5" value="10.0"/></div>
+      <div class="pill">
+        <label>Tol</label>
+        <input id="tol" type="number" step="0.05" value="0.20"/>
+      </div>
+      <div class="pill">
+        <label>km</label>
+        <input id="rad" type="number" step="0.5" value="10.0"/>
+      </div>
     </div>
 
-    <div class="hint">Auto-Geocode läuft im Hintergrund.</div>
+    <div class="hint" id="hint">Auto-Geocode läuft im Hintergrund.</div>
   </div>
 
   <div id="map"></div>
@@ -579,12 +446,13 @@ MAP_HTML = r"""
   <script src="https://unpkg.com/leaflet@1.9.4/dist/leaflet.js"></script>
   <script>
     const map = L.map('map').setView([47.3769, 8.5417], 12);
+
     L.tileLayer('https://{s}.tile.openstreetmap.org/{z}/{x}/{y}.png', {
       maxZoom: 19,
       attribution: '&copy; OpenStreetMap'
     }).addTo(map);
 
-    let layer;
+    let layer = null;
     let requestId = "__REQUEST_ID__" || "";
 
     function bboxStr() {
@@ -600,23 +468,33 @@ MAP_HTML = r"""
       const res = await fetch(url);
       const geo = await res.json();
 
-      if (layer) layer.remove();
+      if (layer) {
+        layer.remove();
+      }
+
       layer = L.geoJSON(geo, {
         pointToLayer: (feature, latlng) => {
           const p = feature.properties || {};
-          const html = `<div class="price-label">${(p.price_chf||0).toLocaleString('de-CH')} CHF</div>`;
+          const html = `<div class="price-label">${(p.price_chf || 0).toLocaleString('de-CH')} CHF</div>`;
           const icon = L.divIcon({ html: html, className: "", iconSize: [1,1] });
+
           return L.marker(latlng, { icon }).bindPopup(
-            `<b>${p.title||''}</b><br/>` +
-            `${(p.price_chf||0).toLocaleString('de-CH')} CHF • ${(p.area_sqm||0).toFixed(0)} m²<br/>` +
-            `${p.address||''}<br/>` +
+            `<b>${p.title || ''}</b><br/>` +
+            `${(p.price_chf || 0).toLocaleString('de-CH')} CHF • ${(p.area_sqm || 0).toFixed(0)} m²<br/>` +
+            `${p.address || ''}<br/>` +
             (p.url ? `<a href="${p.url}" target="_blank">Link</a>` : "")
           );
         }
       }).addTo(map);
     }
 
-    map.on('moveend zoomend', loadData);
+    map.on('moveend zoomend', async () => {
+      try {
+        await loadData();
+      } catch (e) {
+        console.error(e);
+      }
+    });
 
     document.getElementById('toggleAdv').addEventListener('click', () => {
       const adv = document.getElementById('adv');
@@ -625,6 +503,8 @@ MAP_HTML = r"""
 
     document.getElementById('apply').addEventListener('click', async () => {
       const btn = document.getElementById('apply');
+      const hint = document.getElementById('hint');
+
       btn.disabled = true;
       const old = btn.textContent;
       btn.textContent = "Loading…";
@@ -638,46 +518,111 @@ MAP_HTML = r"""
         if (!isFinite(tol) || tol < 0.05) tol = 0.2;
         if (!isFinite(rad) || rad < 0.5) rad = 10.0;
 
-        if (!loc) { alert("Bitte Ort/Adresse eingeben."); return; }
-        if (!isFinite(sqm) || sqm <= 0) { alert("Bitte m² eingeben."); return; }
+        if (!loc) {
+          alert("Bitte Ort/Adresse eingeben.");
+          return;
+        }
+        if (!isFinite(sqm) || sqm <= 0) {
+          alert("Bitte m² eingeben.");
+          return;
+        }
+
+        hint.textContent = "Request läuft…";
 
         const res = await fetch("/valuation/request", {
           method: "POST",
           headers: { "Content-Type": "application/json" },
-          body: JSON.stringify({ location: loc, area_sqm: sqm, tolerance: tol, radius_km: rad })
+          body: JSON.stringify({
+            location: loc,
+            area_sqm: sqm,
+            tolerance: tol,
+            radius_km: rad
+          })
         });
 
         const data = await res.json().catch(() => ({}));
 
         if (!res.ok) {
-          const msg = (typeof data.detail === "string") ? data.detail : JSON.stringify(data.detail || data);
+          const msg = (typeof data.detail === "string")
+            ? data.detail
+            : JSON.stringify(data.detail || data);
           alert(msg || "Fehler beim Request");
+          hint.textContent = "Fehler beim Request.";
           return;
         }
 
         requestId = data.request_id;
-        history.replaceState(null, "", `/map?request_id=${requestId}`);
+
+        history.replaceState(null, "", `/map?request_id=${encodeURIComponent(requestId)}`);
 
         if (data.subject_lat && data.subject_lon) {
           map.setView([data.subject_lat, data.subject_lon], 13);
         }
 
+        hint.textContent = `Request geladen: ${requestId}`;
         await loadData();
+
       } catch (e) {
         alert("Error: " + e.message);
+        hint.textContent = "Fehler beim Laden.";
       } finally {
         btn.disabled = false;
         btn.textContent = old;
       }
     });
 
-    loadData();
+    async function init() {
+      const hint = document.getElementById("hint");
+
+      try {
+        if (requestId) {
+          hint.textContent = `Lade Request ${requestId}…`;
+
+          const res = await fetch(`/debug/request/${encodeURIComponent(requestId)}`);
+          if (res.ok) {
+            const data = await res.json();
+
+            if (data.location) {
+              document.getElementById("loc").value = data.location;
+            }
+            if (data.area_sqm) {
+              document.getElementById("sqm").value = data.area_sqm;
+            }
+            if (data.tolerance) {
+              document.getElementById("tol").value = data.tolerance;
+            }
+            if (data.radius_km) {
+              document.getElementById("rad").value = data.radius_km;
+            }
+
+            if (data.subject_lat && data.subject_lon) {
+              map.setView([data.subject_lat, data.subject_lon], 13);
+            }
+
+            hint.textContent = `Request geladen: ${requestId}`;
+          } else {
+            hint.textContent = "Request-ID gefunden, aber nicht mehr im Speicher.";
+          }
+        }
+
+        await loadData();
+
+      } catch (e) {
+        console.error(e);
+        hint.textContent = "Fehler beim Initialisieren der Map.";
+      }
+    }
+
+    init();
   </script>
 </body>
 </html>
 """
 
 
+# -------------------------
+# Frontend routes
+# -------------------------
 @app.get("/map", response_class=HTMLResponse)
 def map_page(request_id: str = ""):
     return MAP_HTML.replace("__REQUEST_ID__", request_id or "")
@@ -693,23 +638,31 @@ def map_prices(
     except Exception:
         raise HTTPException(status_code=400, detail="Invalid bbox")
 
+    cleanup_requests()
     df = load_dataset_safe()
     filt = REQUESTS.get(request_id) if request_id else None
 
     if filt:
-        target = filt["area_sqm"]
-        tol = filt["tolerance"]
+        target = float(filt["area_sqm"])
+        tol = float(filt["tolerance"])
         lo = target * (1 - tol)
         hi = target * (1 + tol)
         df = df[(df["area_sqm"] >= lo) & (df["area_sqm"] <= hi)]
 
-    df = df.head(300)
+    df = df.head(500)
     features = []
 
     for _, row in df.iterrows():
         addr = str(row["address"])
         key = enqueue_geocode(addr)
         coord = cache_get(key)
+
+        if not coord:
+          q = addr if ("," in addr) else f"{addr}, Schweiz"
+          geo = geocode_photon_ch(q)
+          if geo:
+              cache_set_ok(key, q, geo[0], geo[1])
+              coord = geo
 
         if not coord:
             continue
@@ -730,15 +683,18 @@ def map_prices(
             "type": "Feature",
             "geometry": {"type": "Point", "coordinates": [lon, lat]},
             "properties": {
-                "title": row["title"],
-                "address": row["address"],
+                "title": str(row["title"]),
+                "address": str(row["address"]),
                 "price_chf": int(row["price_chf"]),
                 "area_sqm": float(row["area_sqm"]),
-                "url": row.get("url", "")
+                "url": str(row.get("url", "")),
             }
         })
 
         if len(features) >= 80:
             break
 
-    return JSONResponse({"type": "FeatureCollection", "features": features})
+    return JSONResponse({
+        "type": "FeatureCollection",
+        "features": features
+    })
