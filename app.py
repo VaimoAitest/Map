@@ -1,7 +1,9 @@
+import asyncio
 import math
 import os
 import time
 import uuid
+from contextlib import asynccontextmanager
 from typing import Dict, Optional, Tuple
 
 import pandas as pd
@@ -9,8 +11,6 @@ import requests
 from fastapi import FastAPI, HTTPException, Query
 from fastapi.responses import HTMLResponse, JSONResponse
 from pydantic import BaseModel, Field
-
-app = FastAPI(title="Vaimo Comparable Map API", version="1.1.0")
 
 
 # -------------------------
@@ -78,7 +78,6 @@ def haversine_km(lat1: float, lon1: float, lat2: float, lon2: float) -> float:
     p2 = math.radians(lat2)
     dp = math.radians(lat2 - lat1)
     dl = math.radians(lon2 - lon1)
-
     a = math.sin(dp / 2) ** 2 + math.cos(p1) * math.cos(p2) * math.sin(dl / 2) ** 2
     return 2 * r * math.asin(math.sqrt(a))
 
@@ -150,6 +149,56 @@ def load_dataset_safe() -> pd.DataFrame:
 
 
 # -------------------------
+# Background Warmup
+# -------------------------
+async def warmup_geocode():
+    """Geocodet alle CSV-Adressen beim Start – mit Rate-Limit-Schutz."""
+    await asyncio.sleep(3)  # kurz warten bis Server ready
+    try:
+        df = load_dataset_safe()
+    except Exception as e:
+        print("WARMUP: CSV laden fehlgeschlagen:", e)
+        return
+
+    print(f"WARMUP: {len(df)} Adressen werden geocoded...")
+    done = 0
+    skipped = 0
+
+    for _, row in df.iterrows():
+        addr = str(row["address"])
+        key = enqueue_geocode(addr)
+
+        if cache_get(key):
+            skipped += 1
+            continue  # bereits im Cache
+
+        q = addr if "," in addr else f"{addr}, Schweiz"
+        coord = geocode_photon_ch(q)
+        if coord:
+            cache_set_ok(key, q, coord[0], coord[1])
+            done += 1
+
+        await asyncio.sleep(0.35)  # ~3 req/s → unter Photon-Limit
+
+    print(f"WARMUP DONE: {done} neu geocoded, {skipped} aus Cache, total={done+skipped}/{len(df)}")
+
+
+# -------------------------
+# Lifespan
+# -------------------------
+@asynccontextmanager
+async def lifespan(app: FastAPI):
+    asyncio.create_task(warmup_geocode())
+    yield
+
+
+# -------------------------
+# App
+# -------------------------
+app = FastAPI(title="Vaimo Comparable Map API", version="1.2.0", lifespan=lifespan)
+
+
+# -------------------------
 # Model
 # -------------------------
 class ValuationRequest(BaseModel):
@@ -192,15 +241,21 @@ def create_request(req: ValuationRequest):
     if not subj:
         q2 = req.location.strip()
         q2 = q2 if ("," in q2) else f"{q2}, Schweiz"
-        coord = geocode_photon_ch(q2)
-        if coord:
-            cache_set_ok(key, q2, coord[0], coord[1])
-            subj = coord
+
+        # Retry bis zu 3x mit kurzem Sleep
+        for attempt in range(3):
+            coord = geocode_photon_ch(q2)
+            if coord:
+                cache_set_ok(key, q2, coord[0], coord[1])
+                subj = coord
+                break
+            print(f"GEOCODE RETRY {attempt + 1}/3 für: {q2}")
+            time.sleep(1.5)
 
     if not subj:
         raise HTTPException(
             status_code=503,
-            detail="Geocoding ist gerade limitiert. Bitte in 30–60 Sekunden erneut versuchen."
+            detail="Geocoding fehlgeschlagen. Bitte Adresse präziser eingeben (z.B. 'Berg TG, Schweiz') oder kurz warten."
         )
 
     request_id = "req_" + uuid.uuid4().hex[:10]
