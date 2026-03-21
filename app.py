@@ -1,179 +1,364 @@
-import os, json, time, re, uuid, math
+import json
+import math
+import os
+import time
+import uuid
+from contextlib import asynccontextmanager
+from typing import Dict, Optional, Tuple
+
 import pandas as pd
 import requests
-
-from fastapi import FastAPI, Query, HTTPException
+from fastapi import FastAPI, HTTPException, Query
 from fastapi.responses import HTMLResponse, JSONResponse
-from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel, Field
 
-app = FastAPI(title="VaimoAI Comparable Map")
 
+# -------------------------
+# Config / Paths
+# -------------------------
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
-STATIC_DIR = os.path.join(BASE_DIR, "static")
-DATA_CSV = os.getenv("DATA_CSV", os.path.join(BASE_DIR, "data", "immoscout.csv"))
-CACHE_PATH = os.path.join(BASE_DIR, "geocode_cache.json")
+BASE_MAP_URL = os.getenv("BASE_MAP_URL", "https://map-skur.onrender.com")
+GEOCODE_CACHE_FILE = os.path.join(BASE_DIR, "geocode_cache.json")
 
-if os.path.isdir(STATIC_DIR):
-    app.mount("/static", StaticFiles(directory=STATIC_DIR), name="static")
-
-
-# -------------------------
-# Parse helpers
-# -------------------------
-def parse_int_price(value: str):
-    if not isinstance(value, str):
-        return None
-    cleaned = value.replace("’", "").replace("'", "")
-    digits = re.findall(r"\d+", cleaned)
-    return int("".join(digits)) if digits else None
-
-
-def parse_float_area(value: str):
-    if not isinstance(value, str):
-        return None
-    v = value.replace(",", ".")
-    m = re.search(r"(\d+(?:\.\d+)?)\s*m", v)
-    return float(m.group(1)) if m else None
+DATA_CANDIDATES = [
+    os.path.join(BASE_DIR, "data", "immoscout24_master.csv"),
+    os.path.join(BASE_DIR, "immoscout24_master.csv"),
+    os.path.join(BASE_DIR, "data", "immoscout_master.csv"),
+    os.path.join(BASE_DIR, "immoscout_master.csv"),
+]
 
 
 # -------------------------
-# Geocode cache (best effort)
+# In-memory state
 # -------------------------
-def load_cache():
-    if os.path.exists(CACHE_PATH):
+REQUESTS: Dict[str, Dict] = {}
+GEOCODE_CACHE: Dict[str, Dict] = {}
+
+DATA_CACHE = None
+DATA_CACHE_ERROR = None
+
+
+# -------------------------
+# Helpers
+# -------------------------
+def normalize_text(s: str) -> str:
+    return " ".join(str(s or "").strip().lower().split())
+
+
+def cache_key(address: str) -> str:
+    return normalize_text(address)
+
+
+def load_geocode_cache() -> None:
+    global GEOCODE_CACHE
+    if os.path.exists(GEOCODE_CACHE_FILE):
         try:
-            with open(CACHE_PATH, "r", encoding="utf-8") as f:
-                return json.load(f)
-        except Exception:
-            return {}
-    return {}
+            with open(GEOCODE_CACHE_FILE, "r", encoding="utf-8") as f:
+                GEOCODE_CACHE = json.load(f)
+            print(f"GEOCODE CACHE LOADED: {len(GEOCODE_CACHE)} entries")
+        except Exception as e:
+            print("GEOCODE CACHE LOAD ERROR:", repr(e))
+            GEOCODE_CACHE = {}
+    else:
+        GEOCODE_CACHE = {}
 
 
-def save_cache(cache):
+def save_geocode_cache() -> None:
     try:
-        tmp = CACHE_PATH + ".tmp"
-        with open(tmp, "w", encoding="utf-8") as f:
-            json.dump(cache, f, ensure_ascii=False)
-        os.replace(tmp, CACHE_PATH)
+        tmp_path = GEOCODE_CACHE_FILE + ".tmp"
+        with open(tmp_path, "w", encoding="utf-8") as f:
+            json.dump(GEOCODE_CACHE, f, ensure_ascii=False, indent=2)
+        os.replace(tmp_path, GEOCODE_CACHE_FILE)
+    except Exception as e:
+        print("GEOCODE CACHE SAVE ERROR:", repr(e))
+
+
+def cache_get(key: str) -> Optional[Tuple[float, float]]:
+    item = GEOCODE_CACHE.get(key)
+    if not item:
+        return None
+    try:
+        return float(item["lat"]), float(item["lon"])
     except Exception:
-        pass
-
-
-GEOCODE_CACHE = load_cache()
-
-
-def norm_key(s: str) -> str:
-    return re.sub(r"\s+", " ", (s or "").strip().lower())
-
-
-def nominatim_geocode_ch(q: str):
-    """
-    Geocode only in Switzerland (countrycodes=ch).
-    If user enters a short place like "Berg", we auto-append ", Schweiz".
-    Returns (lat, lon) or None.
-    """
-    if not q or not q.strip():
         return None
 
-    q = q.strip()
-    # make ambiguous queries more Swiss-specific
-    q2 = q if ("," in q) else f"{q}, Schweiz"
 
-    cache_key = norm_key(q2)
-    cached = GEOCODE_CACHE.get(cache_key)
-    if cached and "lat" in cached:
-        return (cached["lat"], cached["lon"])
-
-    url = "https://nominatim.openstreetmap.org/search"
-    params = {
-        "q": q2,
-        "format": "json",
-        "limit": 1,
-        "countrycodes": "ch",
+def cache_set_ok(key: str, query: str, lat: float, lon: float) -> None:
+    GEOCODE_CACHE[key] = {
+        "query": query,
+        "lat": float(lat),
+        "lon": float(lon),
+        "ts": int(time.time()),
     }
-    headers = {"User-Agent": "VaimoAI/1.0 (render)"}
+    save_geocode_cache()
 
-    r = requests.get(url, params=params, headers=headers, timeout=12)
-    r.raise_for_status()
-    data = r.json()
-    if not data:
+
+def geocode_nominatim_ch(query: str) -> Optional[Tuple[float, float]]:
+    try:
+        url = "https://nominatim.openstreetmap.org/search"
+        params = {
+            "q": query,
+            "format": "jsonv2",
+            "limit": 1,
+            "countrycodes": "ch",
+            "addressdetails": 0,
+        }
+        headers = {
+            "User-Agent": "VaimoAI/1.0"
+        }
+
+        r = requests.get(url, params=params, headers=headers, timeout=15)
+        print("NOMINATIM STATUS:", r.status_code, "QUERY:", query)
+        r.raise_for_status()
+
+        data = r.json()
+        if not data:
+            print("NOMINATIM NO RESULT:", query)
+            return None
+
+        lat = float(data[0]["lat"])
+        lon = float(data[0]["lon"])
+        print("NOMINATIM HIT:", query, lat, lon)
+        return lat, lon
+
+    except Exception as e:
+        print("NOMINATIM ERROR:", query, repr(e))
         return None
 
-    lat = float(data[0]["lat"])
-    lon = float(data[0]["lon"])
 
-    GEOCODE_CACHE[cache_key] = {"lat": lat, "lon": lon, "ts": int(time.time())}
-    save_cache(GEOCODE_CACHE)
-    time.sleep(0.12)
-    return (lat, lon)
-
-
-def haversine_km(lat1, lon1, lat2, lon2):
-    R = 6371.0
+def haversine_km(lat1: float, lon1: float, lat2: float, lon2: float) -> float:
+    r = 6371.0
     p1 = math.radians(lat1)
     p2 = math.radians(lat2)
-    dlat = math.radians(lat2 - lat1)
-    dlon = math.radians(lon2 - lon1)
-    a = math.sin(dlat / 2) ** 2 + math.cos(p1) * math.cos(p2) * math.sin(dlon / 2) ** 2
-    c = 2 * math.atan2(math.sqrt(a), math.sqrt(1 - a))
-    return R * c
+    dp = math.radians(lat2 - lat1)
+    dl = math.radians(lon2 - lon1)
+    a = math.sin(dp / 2) ** 2 + math.cos(p1) * math.cos(p2) * math.sin(dl / 2) ** 2
+    return 2 * r * math.asin(math.sqrt(a))
 
 
 # -------------------------
-# Load dataset (your CSV)
+# Data loading
 # -------------------------
-def load_dataset():
-    if not os.path.exists(DATA_CSV):
-        raise FileNotFoundError(f"CSV not found: {DATA_CSV}")
+def load_dataset_safe() -> pd.DataFrame:
+    global DATA_CACHE, DATA_CACHE_ERROR
 
-    df = pd.read_csv(DATA_CSV)
+    if DATA_CACHE is not None:
+        return DATA_CACHE
 
-    # Columns from your exported CSV (adjust if yours differs)
-    col_address = "HgListingCard_address_3884e"
-    col_title = "HgListingDescription_title_fa343"
-    col_area = "HgListingRoomsLivingSpacePrice_roomsLivingSpacePrice_ab258 3"
-    col_price = "HgListingRoomsLivingSpacePrice_price_ad2cb"
-    col_url = "HgCardElevated_content_900d9 href"
+    found = None
+    for path in DATA_CANDIDATES:
+        if os.path.exists(path):
+            found = path
+            break
 
-    for c in [col_address, col_title, col_area, col_price]:
-        if c not in df.columns:
-            raise ValueError(f"Missing column: {c}")
+    if not found:
+        DATA_CACHE_ERROR = f"Keine CSV gefunden. Erwartet eine von: {', '.join(DATA_CANDIDATES)}"
+        raise HTTPException(status_code=500, detail=DATA_CACHE_ERROR)
 
-    df = df.copy()
-    df["address"] = df[col_address].astype(str)
-    df["title"] = df[col_title].astype(str)
-    df["area_sqm"] = df[col_area].apply(parse_float_area)
-    df["price_chf"] = df[col_price].apply(parse_int_price)
-    df["url"] = df[col_url].astype(str) if col_url in df.columns else ""
+    try:
+        df = pd.read_csv(found, sep=None, engine="python")
 
-    df = df.dropna(subset=["area_sqm", "price_chf"])
-    df["area_sqm"] = df["area_sqm"].astype(float)
-    df["price_chf"] = df["price_chf"].astype(int)
-    return df
+        lower_map = {str(c).strip().lower(): c for c in df.columns}
+
+        def col(*names):
+            for n in names:
+                if n.lower() in lower_map:
+                    return lower_map[n.lower()]
+            return None
+
+        title_col = col("title", "titel")
+        address_col = col("address", "adresse")
+        price_col = col("price_chf", "price", "preis", "preis_chf")
+        area_col = col(
+            "area_sqm",
+            "living_area_sqm",
+            "living_area",
+            "fläche",
+            "flaeche",
+            "wohnfläche",
+            "wohnflaeche",
+        )
+        url_col = col("url", "link")
+        lat_col = col("lat", "latitude")
+        lon_col = col("lon", "lng", "longitude")
+        address_key_col = col("address_key")
+
+        required = [title_col, address_col, price_col, area_col, lat_col, lon_col]
+        if not all(required):
+            raise ValueError(
+                "CSV braucht mindestens diese Spalten: title, address, price_chf, area_sqm, lat, lon"
+            )
+
+        clean = pd.DataFrame({
+            "title": df[title_col].astype(str).fillna(""),
+            "address": df[address_col].astype(str).fillna(""),
+            "price_chf": pd.to_numeric(df[price_col], errors="coerce"),
+            "area_sqm": pd.to_numeric(df[area_col], errors="coerce"),
+            "url": df[url_col].astype(str).fillna("") if url_col else "",
+            "lat": pd.to_numeric(df[lat_col], errors="coerce"),
+            "lon": pd.to_numeric(df[lon_col], errors="coerce"),
+            "address_key": (
+                df[address_key_col].astype(str).fillna("")
+                if address_key_col
+                else df[address_col].astype(str).apply(normalize_text)
+            ),
+        })
+
+        clean = clean.dropna(subset=["price_chf", "area_sqm", "lat", "lon"])
+        clean = clean[clean["price_chf"] > 0]
+        clean = clean[clean["area_sqm"] > 0]
+
+        # ungefähr Schweiz
+        clean = clean[(clean["lat"] >= 45) & (clean["lat"] <= 49)]
+        clean = clean[(clean["lon"] >= 5) & (clean["lon"] <= 12)]
+
+        clean = clean.drop_duplicates(
+            subset=["title", "address", "price_chf", "area_sqm", "lat", "lon"]
+        ).reset_index(drop=True)
+
+        DATA_CACHE = clean
+        DATA_CACHE_ERROR = None
+        print("DATASET LOADED:", found, len(clean))
+        return DATA_CACHE
+
+    except Exception as e:
+        DATA_CACHE_ERROR = str(e)
+        raise HTTPException(status_code=500, detail=f"CSV konnte nicht geladen werden: {e}")
 
 
-DATA = load_dataset()
+def find_location_from_dataset(query: str) -> Optional[Tuple[float, float]]:
+    try:
+        df = load_dataset_safe()
+        q = normalize_text(query)
+
+        if not q:
+            return None
+
+        addr_norm = df["address"].astype(str).apply(normalize_text)
+
+        matches = df[addr_norm.str.contains(q, na=False)]
+
+        if matches.empty:
+            # Zusätzliche grobe Suche für Ortsteile / PLZ-Fragmente
+            tokens = [t for t in q.replace(",", " ").split() if len(t) >= 2]
+            if tokens:
+                mask = pd.Series([True] * len(df))
+                for token in tokens:
+                    mask = mask & addr_norm.str.contains(token, na=False)
+                matches = df[mask]
+
+        if matches.empty:
+            print("DATASET NO MATCH:", query)
+            return None
+
+        lat = float(matches["lat"].median())
+        lon = float(matches["lon"].median())
+        print("DATASET MATCH:", query, lat, lon, "rows:", len(matches))
+        return lat, lon
+
+    except Exception as e:
+        print("DATASET LOOKUP ERROR:", query, repr(e))
+        return None
 
 
 # -------------------------
-# Requests (MVP store)
+# Lifespan
 # -------------------------
-REQUESTS = {}
+@asynccontextmanager
+async def lifespan(app: FastAPI):
+    load_geocode_cache()
+    try:
+        load_dataset_safe()
+    except Exception as e:
+        print("DATA PRELOAD ERROR:", repr(e))
+    yield
 
 
+# -------------------------
+# App
+# -------------------------
+app = FastAPI(
+    title="Vaimo Comparable Map API",
+    version="3.0.0",
+    lifespan=lifespan,
+)
+
+
+# -------------------------
+# Models
+# -------------------------
 class ValuationRequest(BaseModel):
     location: str = Field(..., description="Ort oder volle Adresse (Schweiz)")
     area_sqm: float = Field(..., gt=0)
-    tolerance: float = Field(0.2, ge=0.05, le=0.6)  # min 0.05 avoids tol=0 issues
-    radius_km: float = Field(3.0, ge=0.5, le=25.0)
+    tolerance: float = Field(0.2, ge=0.05, le=0.6)
+    radius_km: float = Field(10.0, ge=0.5, le=50.0)
+
+
+# -------------------------
+# API routes
+# -------------------------
+@app.get("/")
+def root():
+    return {"ok": True, "service": "Vaimo Comparable Map API"}
+
+
+@app.get("/health")
+def health():
+    rows = 0
+    try:
+        rows = len(load_dataset_safe())
+    except Exception:
+        pass
+
+    return {
+        "ok": True,
+        "dataset_rows": rows,
+        "csv_error": DATA_CACHE_ERROR,
+        "requests_in_memory": len(REQUESTS),
+        "geocode_cache_entries": len(GEOCODE_CACHE),
+    }
 
 
 @app.post("/valuation/request")
 def create_request(req: ValuationRequest):
-    subj = nominatim_geocode_ch(req.location)
+    key = cache_key(req.location)
+    subj = cache_get(key)
+
+    # 1) Cache
     if not subj:
-        raise HTTPException(status_code=400, detail="Could not geocode location in Switzerland")
+        # 2) Erst in eigener CSV suchen
+        subj = find_location_from_dataset(req.location)
+        if subj:
+            cache_set_ok(key, req.location, subj[0], subj[1])
+
+    # 3) Nur wenn nicht gefunden: extern geocoden
+    if not subj:
+        raw = req.location.strip()
+        candidates = [
+            raw,
+            f"{raw}, Schweiz",
+            f"{raw}, Switzerland",
+        ]
+
+        seen = set()
+        candidates = [c for c in candidates if c and not (c in seen or seen.add(c))]
+
+        for query in candidates:
+            coord = geocode_nominatim_ch(query)
+            if coord:
+                cache_set_ok(key, query, coord[0], coord[1])
+                subj = coord
+                break
+            time.sleep(0.8)
+
+    if not subj:
+        raise HTTPException(
+            status_code=503,
+            detail=(
+                "Geocoding fehlgeschlagen. Bitte gib den Ort genauer ein, "
+                "z. B. 'Berg TG, Schweiz' oder eine vollständige Adresse."
+            )
+        )
 
     request_id = "req_" + uuid.uuid4().hex[:10]
     REQUESTS[request_id] = {
@@ -181,15 +366,31 @@ def create_request(req: ValuationRequest):
         "area_sqm": float(req.area_sqm),
         "tolerance": float(req.tolerance),
         "radius_km": float(req.radius_km),
-        "subject_lat": subj[0],
-        "subject_lon": subj[1],
+        "subject_lat": float(subj[0]),
+        "subject_lon": float(subj[1]),
         "ts": int(time.time()),
     }
+
     return {
         "request_id": request_id,
-        "map_url": f"/map?request_id={request_id}",
-        "subject_lat": subj[0],
-        "subject_lon": subj[1],
+        "map_url": f"{BASE_MAP_URL}/map?request_id={request_id}",
+        "subject_lat": float(subj[0]),
+        "subject_lon": float(subj[1]),
+    }
+
+
+@app.get("/valuation/map/{request_id}")
+def get_comparable_map(request_id: str):
+    r = REQUESTS.get(request_id)
+    if not r:
+        raise HTTPException(status_code=404, detail="unknown request_id")
+
+    url = f"{BASE_MAP_URL}/map?request_id={request_id}"
+    return {
+        "request_id": request_id,
+        "map_url": url,
+        "embed_url": url,
+        "image_url": None,
     }
 
 
@@ -197,12 +398,12 @@ def create_request(req: ValuationRequest):
 def debug_request(request_id: str):
     r = REQUESTS.get(request_id)
     if not r:
-        raise HTTPException(404, "unknown request_id")
+        raise HTTPException(status_code=404, detail="unknown request_id")
     return r
 
 
 # -------------------------
-# HTML template (NO f-string!)
+# HTML
 # -------------------------
 MAP_HTML = r"""
 <!doctype html>
@@ -211,17 +412,14 @@ MAP_HTML = r"""
   <meta charset="utf-8"/>
   <meta name="viewport" content="width=device-width,initial-scale=1"/>
   <title>Vaimo – Comparable Map</title>
-
   <link rel="stylesheet" href="https://unpkg.com/leaflet@1.9.4/dist/leaflet.css"/>
-
   <style>
     html, body, #map {
       height: 100%;
       margin: 0;
       background: #0b0b0b;
-      font-family: -apple-system, BlinkMacSystemFont, "SF Pro Display", "Segoe UI", Arial, sans-serif;
+      font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Arial, sans-serif;
     }
-
     .topbar {
       position: absolute;
       top: 14px;
@@ -229,7 +427,7 @@ MAP_HTML = r"""
       transform: translateX(-50%);
       z-index: 1000;
       width: min(980px, calc(100% - 28px));
-      background: rgba(15, 15, 17, 0.55);
+      background: rgba(15,15,17,0.55);
       border: 1px solid rgba(255,255,255,0.12);
       border-radius: 22px;
       padding: 12px 12px;
@@ -237,51 +435,37 @@ MAP_HTML = r"""
       -webkit-backdrop-filter: blur(14px);
       box-shadow: 0 16px 40px rgba(0,0,0,0.35);
     }
-
-    .row { display:flex; gap:10px; align-items:center; flex-wrap:wrap; }
-
-    .brand {
-      display:flex; align-items:center; gap:10px;
-      padding: 6px 10px;
-      border-radius: 16px;
-      background: rgba(255,255,255,0.06);
-      border: 1px solid rgba(255,255,255,0.10);
+    .row {
+      display: flex;
+      gap: 10px;
+      align-items: center;
+      flex-wrap: wrap;
     }
-
-    .brand img {
-      width: 84px;
-      height: auto;
-      display: block;
-      background: transparent;
-      padding: 0;
-      border-radius: 0;
-    }
-
     .pill {
-      display:flex; align-items:center; gap:8px;
+      display: flex;
+      align-items: center;
+      gap: 8px;
       padding: 8px 10px;
       border-radius: 16px;
       background: rgba(255,255,255,0.06);
       border: 1px solid rgba(255,255,255,0.12);
     }
-
     .pill label {
       font-size: 12px;
       color: rgba(255,255,255,0.70);
       white-space: nowrap;
     }
-
     .pill input {
-      width: 190px;
+      width: 200px;
       border: none;
       outline: none;
       background: transparent;
       color: white;
       font-size: 14px;
     }
-
-    .pill input[type="number"] { width: 115px; }
-
+    .pill input[type="number"] {
+      width: 115px;
+    }
     .btn {
       border: none;
       cursor: pointer;
@@ -291,10 +475,10 @@ MAP_HTML = r"""
       background: rgba(255,255,255,0.92);
       color: #0b0b0b;
     }
-
-    .btn:disabled { opacity: 0.65; cursor: default; }
-    .btn:active { transform: translateY(1px); }
-
+    .btn:disabled {
+      opacity: 0.65;
+      cursor: default;
+    }
     .ghost {
       border: 1px solid rgba(255,255,255,0.14);
       background: rgba(255,255,255,0.06);
@@ -304,14 +488,6 @@ MAP_HTML = r"""
       cursor: pointer;
       font-weight: 700;
     }
-
-    .hint {
-      margin-top: 8px;
-      font-size: 12px;
-      color: rgba(255,255,255,0.70);
-      padding: 0 8px;
-    }
-
     .advanced {
       display: none;
       margin-top: 10px;
@@ -319,7 +495,12 @@ MAP_HTML = r"""
       align-items: center;
       flex-wrap: wrap;
     }
-
+    .hint {
+      margin-top: 8px;
+      font-size: 12px;
+      color: rgba(255,255,255,0.70);
+      padding: 0 8px;
+    }
     .price-label {
       background: rgba(255,255,255,0.96);
       border-radius: 16px;
@@ -330,43 +511,21 @@ MAP_HTML = r"""
     }
   </style>
 </head>
-
 <body>
   <div class="topbar">
     <div class="row">
-      <div class="brand">
-        <img src="/static/vaimo.png" onerror="this.style.display='none'" alt="VAIMO"/>
-      </div>
-
-      <div class="pill" title="Ort oder genaue Adresse (Schweiz)">
-        <label>Ort</label>
-        <input id="loc" placeholder="z.B. Berg TG / Zürich / Adresse" />
-      </div>
-
-      <div class="pill" title="Wohnfläche deines Objekts">
-        <label>m²</label>
-        <input id="sqm" type="number" placeholder="z.B. 100" />
-      </div>
-
-      <button class="btn" id="apply" type="button" title="Filter anwenden">Request</button>
-      <button class="ghost" id="toggleAdv" type="button" title="Toleranz & Radius anzeigen">Erweitert</button>
+      <div class="pill"><label>Ort</label><input id="loc" placeholder="z.B. Zürich / Berg TG / Adresse"/></div>
+      <div class="pill"><label>m²</label><input id="sqm" type="number" placeholder="z.B. 100"/></div>
+      <button class="btn" id="apply" type="button">Request</button>
+      <button class="ghost" id="toggleAdv" type="button">Erweitert</button>
     </div>
 
     <div class="advanced" id="adv">
-      <div class="pill" title="0.20 = ±20% (100m² -> 80 bis 120m²)">
-        <label>Tol</label>
-        <input id="tol" type="number" step="0.05" value="0.20" placeholder="0.20" />
-      </div>
-
-      <div class="pill" title="Umkreis in km um den Standort">
-        <label>km</label>
-        <input id="rad" type="number" step="0.5" value="10.0" placeholder="10.0" />
-      </div>
+      <div class="pill"><label>Tol</label><input id="tol" type="number" step="0.05" value="0.20"/></div>
+      <div class="pill"><label>km</label><input id="rad" type="number" step="0.5" value="10.0"/></div>
     </div>
 
-    <div class="hint">
-      Beispiel: <b>Zürich</b> + <b>100</b> m² → zeigt ähnliche Objekte (m² ± Tol, Umkreis km).
-    </div>
+    <div class="hint" id="hint">Daten mit gespeicherten Koordinaten geladen.</div>
   </div>
 
   <div id="map"></div>
@@ -382,6 +541,7 @@ MAP_HTML = r"""
 
     let layer;
     let requestId = "__REQUEST_ID__" || "";
+    let isLoading = false;
 
     function bboxStr() {
       const b = map.getBounds();
@@ -389,31 +549,49 @@ MAP_HTML = r"""
     }
 
     async function loadData() {
-      const url = requestId
-        ? `/map/prices?request_id=${encodeURIComponent(requestId)}&bbox=${encodeURIComponent(bboxStr())}`
-        : `/map/prices?bbox=${encodeURIComponent(bboxStr())}`;
+      if (isLoading) return;
+      isLoading = true;
 
-      const res = await fetch(url);
-      const geo = await res.json();
+      try {
+        const url = requestId
+          ? `/map/prices?request_id=${encodeURIComponent(requestId)}&bbox=${encodeURIComponent(bboxStr())}`
+          : `/map/prices?bbox=${encodeURIComponent(bboxStr())}`;
 
-      if (layer) layer.remove();
-      layer = L.geoJSON(geo, {
-        pointToLayer: (feature, latlng) => {
-          const p = feature.properties || {};
-          const html = `<div class="price-label">${(p.price_chf||0).toLocaleString('de-CH')} CHF</div>`;
-          const icon = L.divIcon({ html: html, className: "", iconSize: [1,1] });
+        const res = await fetch(url);
+        const geo = await res.json();
 
-          return L.marker(latlng, { icon }).bindPopup(
-            `<b>${p.title||''}</b><br/>` +
-            `${(p.price_chf||0).toLocaleString('de-CH')} CHF • ${(p.area_sqm||0).toFixed(0)} m²<br/>` +
-            `${p.address||''}<br/>` +
-            (p.url ? `<a href="${p.url}" target="_blank">Link</a>` : "")
-          );
-        }
-      }).addTo(map);
+        if (layer) layer.remove();
+
+        layer = L.geoJSON(geo, {
+          pointToLayer: (feature, latlng) => {
+            const p = feature.properties || {};
+            const html = `<div class="price-label">${(p.price_chf || 0).toLocaleString('de-CH')} CHF</div>`;
+            const icon = L.divIcon({ html: html, className: "", iconSize: [1, 1] });
+
+            return L.marker(latlng, { icon }).bindPopup(
+              `<b>${p.title || ''}</b><br/>` +
+              `${(p.price_chf || 0).toLocaleString('de-CH')} CHF • ${(p.area_sqm || 0).toFixed(0)} m²<br/>` +
+              `${p.address || ''}<br/>` +
+              (p.url ? `<a href="${p.url}" target="_blank">Link</a>` : "")
+            );
+          }
+        }).addTo(map);
+      } catch (e) {
+        console.error("loadData error:", e);
+      } finally {
+        isLoading = false;
+      }
     }
 
-    map.on('moveend zoomend', loadData);
+    let moveTimer = null;
+    function scheduleLoad() {
+      clearTimeout(moveTimer);
+      moveTimer = setTimeout(() => {
+        loadData();
+      }, 150);
+    }
+
+    map.on('moveend zoomend', scheduleLoad);
 
     document.getElementById('toggleAdv').addEventListener('click', () => {
       const adv = document.getElementById('adv');
@@ -422,6 +600,7 @@ MAP_HTML = r"""
 
     document.getElementById('apply').addEventListener('click', async () => {
       const btn = document.getElementById('apply');
+      const hint = document.getElementById('hint');
       btn.disabled = true;
       const old = btn.textContent;
       btn.textContent = "Loading…";
@@ -429,33 +608,44 @@ MAP_HTML = r"""
       try {
         const loc = document.getElementById('loc').value.trim();
         const sqm = parseFloat(document.getElementById('sqm').value);
-
         let tol = parseFloat(document.getElementById('tol').value);
         let rad = parseFloat(document.getElementById('rad').value);
 
-        if (!isFinite(tol) || tol < 0.05) tol = 0.2;
+        if (!isFinite(tol) || tol < 0.05) tol = 0.20;
         if (!isFinite(rad) || rad < 0.5) rad = 10.0;
 
-        if (!loc) { alert("Bitte Ort/Adresse eingeben (Schweiz)."); return; }
-        if (!isFinite(sqm) || sqm <= 0) { alert("Bitte Wohnfläche in m² eingeben (z.B. 100)."); return; }
+        if (!loc) {
+          alert("Bitte Ort/Adresse eingeben.");
+          return;
+        }
+        if (!isFinite(sqm) || sqm <= 0) {
+          alert("Bitte m² eingeben.");
+          return;
+        }
 
-        // timeout so it never hangs silently
         const controller = new AbortController();
-        const t = setTimeout(() => controller.abort(), 15000);
+        const timeout = setTimeout(() => controller.abort(), 15000);
 
         const res = await fetch("/valuation/request", {
           method: "POST",
           headers: { "Content-Type": "application/json" },
-          body: JSON.stringify({ location: loc, area_sqm: sqm, tolerance: tol, radius_km: rad }),
+          body: JSON.stringify({
+            location: loc,
+            area_sqm: sqm,
+            tolerance: tol,
+            radius_km: rad
+          }),
           signal: controller.signal
         });
 
-        clearTimeout(t);
+        clearTimeout(timeout);
 
         const data = await res.json().catch(() => ({}));
 
         if (!res.ok) {
-          const msg = (typeof data.detail === "string") ? data.detail : JSON.stringify(data.detail || data);
+          const msg = (typeof data.detail === "string")
+            ? data.detail
+            : JSON.stringify(data.detail || data);
           alert(msg || "Fehler beim Request");
           return;
         }
@@ -467,20 +657,52 @@ MAP_HTML = r"""
           map.setView([data.subject_lat, data.subject_lon], 13);
         }
 
+        hint.textContent = `Request geladen: ${requestId}`;
         await loadData();
-
-        // If 0 results, give a helpful hint
-        // (We keep it simple: user can increase km/tol.)
-        // You can later auto-expand if needed.
       } catch (e) {
-        alert(e.name === "AbortError" ? "Timeout (15s) – Free Render kann schlafen. Nochmal klicken." : ("JS Error: " + e.message));
+        alert(
+          e.name === "AbortError"
+            ? "Timeout (15s) – Free Render kann schlafen. Nochmal klicken."
+            : ("Error: " + e.message)
+        );
       } finally {
         btn.disabled = false;
         btn.textContent = old;
       }
     });
 
-    loadData();
+    async function init() {
+      const hint = document.getElementById("hint");
+
+      try {
+        if (requestId) {
+          const res = await fetch(`/debug/request/${encodeURIComponent(requestId)}`);
+          if (res.ok) {
+            const data = await res.json();
+
+            if (data.location) document.getElementById("loc").value = data.location;
+            if (data.area_sqm) document.getElementById("sqm").value = data.area_sqm;
+            if (data.tolerance) document.getElementById("tol").value = data.tolerance;
+            if (data.radius_km) document.getElementById("rad").value = data.radius_km;
+
+            if (data.subject_lat && data.subject_lon) {
+              map.setView([data.subject_lat, data.subject_lon], 13);
+            }
+
+            hint.textContent = `Request geladen: ${requestId}`;
+          } else {
+            hint.textContent = "Request-ID gefunden, aber nicht mehr im Speicher.";
+          }
+        }
+
+        await loadData();
+      } catch (e) {
+        console.error(e);
+        hint.textContent = "Fehler beim Initialisieren der Map.";
+      }
+    }
+
+    init();
   </script>
 </body>
 </html>
@@ -494,77 +716,64 @@ def map_page(request_id: str = ""):
 
 @app.get("/map/prices")
 def map_prices(
-    bbox: str = Query(..., description="west,south,east,north"),
-    request_id: str = Query("", description="Created by /valuation/request")
+    bbox: str = Query(...),
+    request_id: str = Query("")
 ):
     try:
         west, south, east, north = [float(x) for x in bbox.split(",")]
     except Exception:
         raise HTTPException(status_code=400, detail="Invalid bbox")
 
+    df = load_dataset_safe()
     filt = REQUESTS.get(request_id) if request_id else None
 
-    # MVP approach:
-    # 1) Pre-filter by area if request exists
-    # 2) Geocode only the first N candidates to keep it usable on free tier
-    df = DATA
-
     if filt:
-        target = filt["area_sqm"]
-        tol = filt["tolerance"]
+        target = float(filt["area_sqm"])
+        tol = float(filt["tolerance"])
         lo = target * (1 - tol)
         hi = target * (1 + tol)
         df = df[(df["area_sqm"] >= lo) & (df["area_sqm"] <= hi)]
 
-    # limit candidates to reduce geocode load per request
-    df = df.head(350)
+    # zuerst bbox, dann optional radius, dann sortieren, dann limitieren
+    df = df[
+        (df["lon"] >= west) &
+        (df["lon"] <= east) &
+        (df["lat"] >= south) &
+        (df["lat"] <= north)
+    ]
 
-    # Geocode listing addresses (cached, Switzerland-only)
-    rows = []
-    for _, row in df.iterrows():
-        coord = nominatim_geocode_ch(row["address"])
-        if coord:
-            rows.append((row, coord[0], coord[1]))
+    if filt and not df.empty:
+        subj_lat = float(filt["subject_lat"])
+        subj_lon = float(filt["subject_lon"])
+        rad = float(filt["radius_km"])
+
+        df = df.copy()
+        df["distance_km"] = df.apply(
+            lambda row: haversine_km(subj_lat, subj_lon, float(row["lat"]), float(row["lon"])),
+            axis=1
+        )
+        df = df[df["distance_km"] <= rad]
+        df = df.sort_values(["distance_km", "price_chf"])
+    else:
+        df = df.sort_values(["price_chf", "area_sqm"])
+
+    df = df.head(80)
 
     features = []
-
-    if filt:
-        subj_lat = filt["subject_lat"]
-        subj_lon = filt["subject_lon"]
-        rad = filt["radius_km"]
-
-        for row, lat, lon in rows:
-            if not (west <= lon <= east and south <= lat <= north):
-                continue
-            if haversine_km(subj_lat, subj_lon, lat, lon) > rad:
-                continue
-
-            features.append({
-                "type": "Feature",
-                "geometry": {"type": "Point", "coordinates": [lon, lat]},
-                "properties": {
-                    "title": row["title"],
-                    "address": row["address"],
-                    "price_chf": int(row["price_chf"]),
-                    "area_sqm": float(row["area_sqm"]),
-                    "url": row.get("url", "")
-                }
-            })
-    else:
-        # preview mode: show some points in view
-        for row, lat, lon in rows[:80]:
-            if not (west <= lon <= east and south <= lat <= north):
-                continue
-            features.append({
-                "type": "Feature",
-                "geometry": {"type": "Point", "coordinates": [lon, lat]},
-                "properties": {
-                    "title": row["title"],
-                    "address": row["address"],
-                    "price_chf": int(row["price_chf"]),
-                    "area_sqm": float(row["area_sqm"]),
-                    "url": row.get("url", "")
-                }
-            })
+    for _, row in df.iterrows():
+        features.append({
+            "type": "Feature",
+            "geometry": {
+                "type": "Point",
+                "coordinates": [float(row["lon"]), float(row["lat"])]
+            },
+            "properties": {
+                "title": row["title"],
+                "address": row["address"],
+                "price_chf": int(float(row["price_chf"])),
+                "area_sqm": float(row["area_sqm"]),
+                "url": row.get("url", "")
+            }
+        })
 
     return JSONResponse({"type": "FeatureCollection", "features": features})
